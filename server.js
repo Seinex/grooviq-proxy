@@ -90,11 +90,35 @@ function durOk(got, want) {
   if (!got || !want) return true;
   return Math.abs(got - want) <= Math.max(30, Math.round(want * 0.1));
 }
+// Positive title match: ≥60% of significant words from expected must appear in result.
+// Prevents accepting a completely different song just because it's not karaoke.
+function titleOk(result = '', expected = '') {
+  if (!result || !expected) return true;
+  const clean = s => s.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const rt = clean(result), et = clean(expected);
+  if (rt.includes(et) || et.includes(rt)) return true;
+  const words = et.split(' ').filter(w => w.length > 2);
+  if (!words.length) return true;
+  return words.filter(w => rt.includes(w)).length / words.length >= 0.6;
+}
 function bestAudio(info) {
   const af = info.streaming_data?.adaptive_formats ?? [];
   const ao = af.filter(f => f.mime_type?.includes('audio') && !f.mime_type?.includes('video') && f.url);
   return ao.find(f => f.mime_type?.startsWith('audio/mp4')) ||
          ao.find(f => f.mime_type?.startsWith('audio/'));
+}
+// Try IOS → TV_EMBEDDED → ANDROID — avoids SABR (no direct URL) on ANDROID client
+async function getAudioFormat(yt, videoId) {
+  for (const client of ['IOS', 'TV_EMBEDDED', 'ANDROID']) {
+    try {
+      const info = await yt.getBasicInfo(videoId, { client });
+      const fmt  = bestAudio(info);
+      if (fmt?.url) return { info, fmt };
+    } catch (e) {
+      console.warn(`[cloud] ${client} client error for ${videoId}:`, e.message);
+    }
+  }
+  return null;
 }
 const YT_HEADERS = {
   'User-Agent': 'com.google.android.youtube/19.09.37 (Linux; U; Android 14) gzip',
@@ -206,67 +230,70 @@ const server = http.createServer(async (req, res) => {
 
     // Direct lookup when a real YouTube video ID was supplied
     if (isYtId) {
-      const info   = await yt.getBasicInfo(rawId, { client: 'ANDROID' });
-      const format = bestAudio(info);
-      if (!format?.url) {
+      const result = await getAudioFormat(yt, rawId);
+      if (!result?.fmt?.url) {
         res.writeHead(404); res.end(JSON.stringify({ error: 'No audio format for supplied videoId' })); return;
       }
-      sendStream(rawId, format.url, info.basic_info?.duration ?? expectedDur, 'youtube-direct');
+      sendStream(rawId, result.fmt.url, result.info.basic_info?.duration ?? expectedDur, 'youtube-direct');
       return;
     }
 
-    // Search YouTube Music — ISRC first (most precise), then title+artist
-    const queries = isrc ? [isrc, `${title} ${artist}`] : [`${title} ${artist}`];
+    // ── Phase 1: YouTube Music catalog (song + video types) ──────────────────
+    // Search both 'song' AND 'video' — East African / regional artists are often
+    // catalogued only as 'video' type in YTM. ISRC query first (globally unique).
+    const queries = isrc ? [isrc, `${title} ${artist}`] : [`${title} ${artist}`, `${title} ${artist} official`];
     let songs = [];
     for (const sq of queries) {
       console.log('[cloud] YTM search:', sq);
-      const r = await yt.music.search(sq, { type: 'song' });
-      songs = Array.from(r.songs?.contents || []);
-      if (songs.length) break;
+      const [songRes, videoRes] = await Promise.allSettled([
+        yt.music.search(sq, { type: 'song'  }),
+        yt.music.search(sq, { type: 'video' }),
+      ]);
+      const songItems  = songRes.status  === 'fulfilled' ? Array.from(songRes.value.songs?.contents  || []) : [];
+      const videoItems = videoRes.status === 'fulfilled' ? Array.from(videoRes.value.videos?.contents || []) : [];
+      songs = [...songItems, ...videoItems];
+      if (songs.length) { console.log(`[cloud] "${sq}" → ${songs.length} candidates`); break; }
     }
 
-    if (!songs.length) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ error: 'No YTM search results' }));
-      return;
-    }
-
-    // Candidate scoring — same logic as PC app
+    // Candidate scoring — same logic as Android app
     let bestCandidate = null;
     let bestScore     = -1;
 
-    for (const song of songs.slice(0, 5)) {
+    for (const song of songs.slice(0, 8)) {
       const sid = song.id;
       if (!sid) continue;
 
+      // Positive title match — reject completely different songs
+      if (!titleOk(song.title ?? '', title)) {
+        console.log(`[cloud] title mismatch: want "${title}", got "${song.title}"`); continue;
+      }
       if (isBad(song.title ?? '', title)) {
         console.log(`[cloud] rejected "${song.title}" (bad filter)`); continue;
       }
 
+      // Artist match on catalog metadata (includes ALL artists: "Bien, Alikiba")
       const songArtists = (song.artists ?? []).map(a => a.name ?? '').join(', ');
-      if (!artistOk(songArtists, artist)) {
+      if (songArtists && !artistOk(songArtists, artist)) {
         console.log(`[cloud] artist mismatch: want "${artist}", got "${songArtists}"`); continue;
       }
 
-      const info = await yt.getBasicInfo(sid, { client: 'ANDROID' });
-      const dur  = info.basic_info?.duration ?? 0;
+      const result = await getAudioFormat(yt, sid);
+      if (!result) { console.warn(`[cloud] no CDN URL for ${sid} (all clients exhausted)`); continue; }
+      const { info, fmt: format } = result;
+
+      const dur = info.basic_info?.duration ?? 0;
       if (!durOk(dur, expectedDur)) {
         console.log(`[cloud] duration mismatch: want ~${expectedDur}s, got ${dur}s`); continue;
       }
-
-      const format = bestAudio(info);
-      if (!format?.url) continue;
 
       const author     = info.basic_info?.author ?? '';
       const videoTitle = (info.basic_info?.title ?? song.title ?? '').toLowerCase();
       const mvType     = info.basic_info?.music_video_type ?? '';
 
-      // Topic channel → auto-generated official recording, return immediately
+      // Topic / Art Track → official label delivery, return immediately
       if (author.endsWith(' - Topic')) {
         sendStream(sid, format.url, dur, 'youtube-topic'); return;
       }
-
-      // Art Track (AUD_TRACK) → can ONLY be created by a label, same reliability as Topic
       if (mvType === 'MUSIC_VIDEO_TYPE_AUD_TRACK') {
         sendStream(sid, format.url, dur, 'youtube-art-track'); return;
       }
@@ -274,16 +301,83 @@ const server = http.createServer(async (req, res) => {
       let score = 0;
       if (mvType === 'MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC') score += 65;
       if (/\(official\s*(audio|video|music\s*video|lyric\s*video)\)/i.test(videoTitle) ||
-          /\[official\s*(audio|video|music\s*video)\]/i.test(videoTitle) ||
           videoTitle.includes('(official)') || videoTitle.includes('[official]')) score += 50;
       if (author && artistOk(author, artist)) score += 20;
 
-      if (score > bestScore) {
+      // Require at least one confidence signal — prevents zero-score wrong songs
+      if (score > 0 && score > bestScore) {
         bestCandidate = { url: format.url, duration: dur, videoId: sid };
         bestScore = score;
-        const tag = score >= 65 ? '✓ official MV' : score >= 50 ? '✓ official release' : score >= 20 ? '✓ artist channel' : 'candidate';
+        const tag = score >= 65 ? '✓ official MV' : score >= 50 ? '✓ official release' : '✓ artist channel';
         console.log(`[cloud] ${tag} (score ${score}) "${author}": "${title}"`);
+        if (bestScore >= 65) break; // confident enough
       }
+    }
+
+    if (bestCandidate) {
+      sendStream(bestCandidate.videoId, bestCandidate.url, bestCandidate.duration, 'youtube-cloud');
+      return;
+    }
+
+    // ── Phase 2: Regular YouTube search (for artists not in YTM catalog) ──────
+    // Same strategy as Android app's Phase 2 — searches all of YouTube, not just
+    // the music catalog. This is what yt-dlp does and why desktop works correctly.
+    // Artist-channel match is NOT a hard filter: featured collabs (e.g. "Finale"
+    // by Bien ft. Alikiba) are often uploaded to the featured artist's channel.
+    console.log('[cloud] Phase 2 — regular YouTube search for:', title, 'by', artist);
+    try {
+      const p2Queries = [`${title} ${artist} official`, `${title} ${artist}`];
+      for (const p2q of p2Queries) {
+        if (bestScore >= 50) break;
+        const ytSearch = await yt.search(p2q);
+        const ytVideos = (ytSearch.results ?? []).filter(
+          v => v.type === 'Video' || v.constructor?.name === 'Video',
+        );
+        console.log(`[cloud] Phase2 "${p2q}" → ${ytVideos.length} results`);
+
+        for (const video of ytVideos.slice(0, 8)) {
+          const vid = video.id;
+          if (!vid || vid.length !== 11) continue;
+
+          const ytTitle = video.title?.text ?? video.title?.toString?.() ?? String(video.title ?? '');
+          const ytDur   = video.duration?.seconds ?? 0;
+
+          if (!titleOk(ytTitle, title)) continue;
+          if (isBad(ytTitle, title)) continue;
+          if (!durOk(ytDur, expectedDur)) continue;
+
+          const result2 = await getAudioFormat(yt, vid);
+          if (!result2) continue;
+          const { info: info2, fmt: fmt2 } = result2;
+
+          const dur2    = info2.basic_info?.duration ?? 0;
+          if (!durOk(dur2, expectedDur)) continue;
+
+          const author2  = info2.basic_info?.author ?? '';
+          const title2   = (info2.basic_info?.title ?? ytTitle).toLowerCase();
+          const mvType2  = info2.basic_info?.music_video_type ?? '';
+
+          if (author2.endsWith(' - Topic') || mvType2 === 'MUSIC_VIDEO_TYPE_AUD_TRACK') {
+            sendStream(vid, fmt2.url, dur2, 'youtube-topic'); return;
+          }
+
+          // Base score of 5: YouTube's own ranking already filtered by artist in the query
+          let score2 = 5;
+          if (mvType2 === 'MUSIC_VIDEO_TYPE_OFFICIAL_SOURCE_MUSIC')                  score2 += 65;
+          if (/\(official\s*(audio|video|music\s*video|lyric\s*video)\)/i.test(title2) ||
+              title2.includes('(official)') || title2.includes('[official]'))         score2 += 50;
+          if (author2 && artistOk(author2, artist))                                  score2 += 20;
+
+          if (score2 > bestScore) {
+            bestCandidate = { url: fmt2.url, duration: dur2, videoId: vid };
+            bestScore = score2;
+            console.log(`[cloud] Phase2 candidate (score ${score2}) "${author2}": "${title}"`);
+            if (bestScore >= 50) break;
+          }
+        }
+      }
+    } catch (p2err) {
+      console.warn('[cloud] Phase2 failed:', p2err.message);
     }
 
     if (bestCandidate) {
@@ -293,7 +387,7 @@ const server = http.createServer(async (req, res) => {
 
     console.warn(`[cloud] no verified candidate for: "${title}" by "${artist}"`);
     res.writeHead(404);
-    res.end(JSON.stringify({ error: 'No verified YTM candidate found' }));
+    res.end(JSON.stringify({ error: 'No verified candidate found' }));
 
   } catch (err) {
     console.error('[cloud] /stream error:', err.message);
