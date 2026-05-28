@@ -1,0 +1,16 @@
+{
+  "name": "grooviq-cloud-proxy",
+  "version": "1.0.0",
+  "description": "Grooviq cloud stream resolver — gives Android users worldwide desktop-quality tracks",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "youtubei.js": "^10.4.0"
+  }
+}

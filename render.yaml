@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: grooviq-proxy
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: CLOUD_TOKEN
+        value: grooviq-cloud-2026
+      - key: NODE_ENV
+        value: production
