@@ -83,8 +83,28 @@ function isBad(rt = '', qt = '') {
 }
 function artistOk(got = '', want = '') {
   if (!got || !want) return true;
+  const result = got.toLowerCase();
   const words = want.toLowerCase().split(/[\s,&]+/).filter(w => w.length > 2);
-  return !words.length || words.some(w => got.toLowerCase().includes(w));
+  // Word-boundary match: "Bien" must NOT match "Bienvenido" or "Ambience"
+  return !words.length || words.some(w => {
+    try { return new RegExp(`\\b${w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(result); }
+    catch (_) { return result.includes(w); }
+  });
+}
+// Extract every artist name from a track: primary + any "feat." partners in the title.
+// "Finale" by Bien ft. Alikiba  →  ["bien", "alikiba"]
+function extractAllArtists(trackTitle = '', trackArtist = '') {
+  const words = new Set();
+  const esc = w => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  (trackArtist)
+    .split(/\s*(?:ft\.?|feat\.?|featuring|&|,|×)\s*/i)
+    .flatMap(a => a.trim().split(/\s+/))
+    .filter(w => w.length > 2)
+    .forEach(w => words.add(esc(w.toLowerCase())));
+  const fm = trackTitle.match(/(?:feat\.?|ft\.?|featuring)\s+([^)\]]+)/i);
+  if (fm) fm[1].split(/[\s,&]+/).filter(w => w.length > 2)
+    .forEach(w => words.add(esc(w.toLowerCase())));
+  return [...words];
 }
 function durOk(got, want) {
   if (!got || !want) return true;
@@ -327,6 +347,7 @@ const server = http.createServer(async (req, res) => {
     console.log('[cloud] Phase 2 — regular YouTube search for:', title, 'by', artist);
     try {
       const p2Queries = [`${title} ${artist} official`, `${title} ${artist}`];
+      const p2Artists = extractAllArtists(title, artist); // word list for channel filter
       for (const p2q of p2Queries) {
         if (bestScore >= 50) break;
         const ytSearch = await yt.search(p2q);
@@ -339,12 +360,25 @@ const server = http.createServer(async (req, res) => {
           const vid = video.id;
           if (!vid || vid.length !== 11) continue;
 
-          const ytTitle = video.title?.text ?? video.title?.toString?.() ?? String(video.title ?? '');
-          const ytDur   = video.duration?.seconds ?? 0;
+          const ytTitle   = video.title?.text ?? video.title?.toString?.() ?? String(video.title ?? '');
+          const ytChannel = (video.author?.name ?? '').toLowerCase();
+          const ytDur     = video.duration?.seconds ?? 0;
 
           if (!titleOk(ytTitle, title)) continue;
           if (isBad(ytTitle, title)) continue;
           if (!durOk(ytDur, expectedDur)) continue;
+
+          // Artist channel filter — word boundary, checks primary + featured artists
+          if (p2Artists.length > 0) {
+            const chOk = p2Artists.some(w => {
+              try { return new RegExp(`\\b${w}\\b`).test(ytChannel); }
+              catch (_) { return ytChannel.includes(w); }
+            });
+            if (!chOk) {
+              console.log(`[cloud] Phase2 skip: "${video.author?.name}" ∉ {${p2Artists.join('|')}} for "${title}"`);
+              continue;
+            }
+          }
 
           const result2 = await getAudioFormat(yt, vid);
           if (!result2) continue;
