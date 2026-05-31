@@ -180,6 +180,41 @@ async function getVideoFormat(yt, videoId) {
   return null;
 }
 
+// ── iTunes music-video CLIP (legal, server-side — Apple CDN isn't datacenter-blocked) ──
+// Apple serves official ~30s music-video previews via the free iTunes Search API.
+// We STRICT-match artist+title (Apple search otherwise returns KIDZ BOP / covers /
+// lyric-videos by random people), then range-fetch the first ~500KB (a few seconds,
+// self-contained m4v). Returns Buffer or null. Cached per query 6h.
+const _itunesBytes = new Map();
+function _normt(s = '') { return s.toLowerCase().replace(/\(.*?\)|\[.*?\]|feat.*$|ft\..*$/g, '').replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim(); }
+async function getItunesClipBytes(title, artist) {
+  const key = `${title}|${artist}`.toLowerCase();
+  const c = _itunesBytes.get(key);
+  if (c && Date.now() - c.at < 6 * 60 * 60 * 1000) return c.buf;
+  try {
+    const term = encodeURIComponent(`${title} ${artist}`.trim());
+    const r = await fetch(`https://itunes.apple.com/search?term=${term}&entity=musicVideo&limit=12&country=US`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const j = await r.json();
+    const wantT = _normt(title), wantA = _normt(artist), aWords = wantA.split(' ').filter(Boolean);
+    const hit = (j.results || []).find((x) => {
+      if (!x.previewUrl) return false;
+      const n = _normt(x.trackName), a = _normt(x.artistName);
+      const titleOk = n && (n.includes(wantT) || wantT.includes(n));
+      const artistOk = aWords.length && aWords.some((w) => w.length > 2 && a.includes(w));
+      return titleOk && artistOk;
+    });
+    if (!hit) { _itunesBytes.set(key, { buf: null, at: Date.now() }); return null; }
+    const vr = await fetch(hit.previewUrl, { headers: { Range: 'bytes=0-511999', 'User-Agent': 'Mozilla/5.0' } });
+    if (vr.status !== 200 && vr.status !== 206) return null;
+    const buf = Buffer.from(await vr.arrayBuffer());
+    if (buf.length < 5000) return null;
+    _itunesBytes.set(key, { buf, at: Date.now() });
+    if (_itunesBytes.size > 60) _itunesBytes.delete(_itunesBytes.keys().next().value);
+    console.log(`[itunesclip] "${title}" → ${hit.trackName}/${hit.artistName} ${Math.round(buf.length / 1024)}KB`);
+    return buf;
+  } catch (e) { console.warn('[itunesclip]', e.message); return null; }
+}
+
 // ── Music-video CLIP (for songs without a Spotify Canvas) ─────────────────────
 // Resolves the official video, then fetches only the FIRST ~400KB of the lowest
 // (≈240p) mp4 — a self-contained ~12s segment (starts with ftyp+moov) — and serves
@@ -369,8 +404,9 @@ const server = http.createServer(async (req, res) => {
   // natively (expo-video), muted + looped. No ads, light, no 403.
   if (parsed.pathname === '/videoclip') {
     try {
-      const yt = await getYtClient();
-      const buf = await getClipBytes(yt, { id: q.id, title: q.title, artist: q.artist });
+      // iTunes (legal, server-side, strict-matched). YouTube is datacenter-blocked
+      // here, so the app does YouTube in-app as its own last-resort fallback.
+      const buf = await getItunesClipBytes(q.title || '', q.artist || '');
       if (!buf) { res.writeHead(404); res.end(JSON.stringify({ error: 'no clip' })); return; }
       res.writeHead(200, {
         'Content-Type': 'video/mp4',
