@@ -191,12 +191,13 @@ export async function canvasDiag(title = 'Espresso', artist = 'Sabrina Carpenter
     out.ccTokenOk = !!d.access_token;
     if (d.error) out.ccError = `${d.error}: ${d.error_description || ''}`.slice(0, 80);
     if (d.access_token) {
-      const sr = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&q=${encodeURIComponent(`${title} ${artist}`)}`, {
+      const sr = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&market=US&q=${encodeURIComponent(`${title} ${artist}`)}`, {
         headers: { Authorization: `Bearer ${d.access_token}` },
       });
       out.searchStatus = sr.status;
-      const sd = await sr.json().catch(() => ({}));
-      out.foundUri = sd?.tracks?.items?.[0]?.uri || null;
+      const raw = await sr.text();
+      try { const sd = JSON.parse(raw); out.foundUri = sd?.tracks?.items?.[0]?.uri || null; out.searchErr = sd?.error?.message; }
+      catch { out.searchBody = raw.slice(0, 120); }
     }
   } catch (e) { out.exception = e.message; }
   return out;
