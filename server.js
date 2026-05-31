@@ -161,6 +161,53 @@ function httpsGetJson(url, extraHeaders = {}) {
   });
 }
 
+// ── Share landing page ────────────────────────────────────────────────────────
+// Served at /s?title=…&artist=…&art=… — opens the app via grooviq:// or offers
+// the APK download. APK is downloaded from /grooviq.apk (served by Render static
+// or, until then, the GitHub release asset linked below).
+const APK_URL = 'https://github.com/Seinex/grooviq-proxy/releases/latest/download/Grooviq.apk';
+function esc(s = '') {
+  return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+}
+function landingHtml(title, artist, art) {
+  const t = esc(title), a = esc(artist), img = esc(art);
+  const deep = `grooviq://track?title=${encodeURIComponent(title)}&artist=${encodeURIComponent(artist)}`;
+  return `<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>${t ? t + ' — Grooviq' : 'Grooviq'}</title>
+<style>
+:root{--bg:#121212;--bg2:#1f1f1f;--green:#1ED760;--white:#fff;--muted:#b3b3b3}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--white);
+font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.wrap{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:32px 24px}
+.logo{width:72px;height:72px;border-radius:50%;background:var(--green);display:flex;align-items:center;justify-content:center;margin-bottom:18px}
+.logo svg{width:38px;height:38px}
+.brand{font-size:30px;font-weight:900;letter-spacing:.5px;margin:0 0 6px}
+.art{width:200px;height:200px;border-radius:10px;object-fit:cover;margin:24px 0 18px;box-shadow:0 12px 40px rgba(0,0,0,.6);background:var(--bg2)}
+.title{font-size:22px;font-weight:800;margin:0 0 4px}
+.artist{font-size:15px;color:var(--muted);margin:0 0 28px}
+.btn{display:block;width:100%;max-width:340px;padding:15px 24px;border-radius:28px;font-size:16px;font-weight:800;text-decoration:none;border:none;cursor:pointer}
+.btn-primary{background:var(--green);color:#000;margin-bottom:14px}
+.btn-ghost{background:transparent;color:var(--white);border:1px solid #7c7c7c}
+.hint{color:var(--muted);font-size:13px;margin-top:22px;max-width:320px;line-height:1.5}
+.foot{color:#535353;font-size:12px;margin-top:34px}
+</style></head><body><div class="wrap">
+<div class="logo"><svg viewBox="0 0 24 24" fill="#121212"><path d="M12 3v10.55A4 4 0 1 0 14 17V7h4V3h-6z"/></svg></div>
+<h1 class="brand">Grooviq</h1>
+${img ? `<img class="art" src="${img}" alt=""/>` : ''}
+${t ? `<div class="title">${t}</div>` : ''}
+${a ? `<div class="artist">${a}</div>` : ''}
+<a id="open" class="btn btn-primary" href="${deep}">Open in Grooviq</a>
+<a class="btn btn-ghost" href="${APK_URL}">Get the app (free)</a>
+<p class="hint">Have Grooviq? It should open automatically. New here? Tap <b>Get the app</b> to install.</p>
+<div class="foot">Your global music radar.</div>
+</div><script>
+var isMobile=/Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+if(isMobile && ${t ? 'true' : 'false'}){setTimeout(function(){window.location.href=${JSON.stringify(deep)};},400);}
+</script></body></html>`;
+}
+
 // ── HTTP server ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -176,6 +223,17 @@ const server = http.createServer(async (req, res) => {
 
   const parsed = parseUrl(req.url, true);
   const q      = parsed.query;
+
+  // ── /s — public share landing page (NO token; this is meant to be shared) ──
+  // grooviq://… deep links aren't clickable in most chat apps and do nothing for
+  // people without the app. A shared song points here instead: the page tries to
+  // open Grooviq, and falls back to the APK download for newcomers.
+  if (parsed.pathname === '/s' || parsed.pathname === '/') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.writeHead(200);
+    res.end(landingHtml(q.title || '', q.artist || '', q.art || ''));
+    return;
+  }
 
   // All endpoints require the shared token
   if (q.token !== CLOUD_TOKEN) {
