@@ -177,6 +177,31 @@ async function fetchCanvas(trackUri) {
   return url;
 }
 
+// Diagnostic: reports why search may be failing (no secret leaked).
+export async function canvasDiag(title = 'Espresso', artist = 'Sabrina Carpenter') {
+  const out = { secretSet: !!SPOTIFY_CLIENT_SECRET, clientId: SPOTIFY_CLIENT_ID.slice(0, 6) + '…' };
+  try {
+    const auth = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+    const r = await fetch('https://accounts.spotify.com/api/token', {
+      method: 'POST', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'grant_type=client_credentials',
+    });
+    const d = await r.json();
+    out.ccTokenStatus = r.status;
+    out.ccTokenOk = !!d.access_token;
+    if (d.error) out.ccError = `${d.error}: ${d.error_description || ''}`.slice(0, 80);
+    if (d.access_token) {
+      const sr = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&q=${encodeURIComponent(`${title} ${artist}`)}`, {
+        headers: { Authorization: `Bearer ${d.access_token}` },
+      });
+      out.searchStatus = sr.status;
+      const sd = await sr.json().catch(() => ({}));
+      out.foundUri = sd?.tracks?.items?.[0]?.uri || null;
+    }
+  } catch (e) { out.exception = e.message; }
+  return out;
+}
+
 /**
  * Resolve a Canvas mp4 URL for a track.
  * @param {{ id?: string, title?: string, artist?: string }} opts

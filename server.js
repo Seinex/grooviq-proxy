@@ -18,7 +18,7 @@ import https  from 'https';
 import crypto from 'crypto';
 import { parse as parseUrl } from 'url';
 import { Innertube } from 'youtubei.js';
-import { getCanvasUrl, canvasConfigured } from './canvas.js';
+import { getCanvasUrl, canvasConfigured, canvasDiag } from './canvas.js';
 
 // Render.com sets $PORT automatically (usually 10000). On other hosts use 4568.
 const PORT         = parseInt(process.env.PORT  || '4568', 10);
@@ -279,6 +279,12 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, app: 'Grooviq Cloud' }));
     return;
+  }
+
+  // ── /canvasdiag — debug why search may fail (no secret leaked) ──
+  if (parsed.pathname === '/canvasdiag') {
+    const d = await canvasDiag();
+    res.writeHead(200); res.end(JSON.stringify(d)); return;
   }
 
   // ── /canvas — ad-free Spotify Canvas mp4 for the player's looping background ──
