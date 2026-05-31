@@ -186,31 +186,45 @@ async function getVideoFormat(yt, videoId) {
 // lyric-videos by random people), then range-fetch the first ~500KB (a few seconds,
 // self-contained m4v). Returns Buffer or null. Cached per query 6h.
 const _itunesBytes = new Map();
+const _itunesMatch = new Map();
 function _normt(s = '') { return s.toLowerCase().replace(/\(.*?\)|\[.*?\]|feat.*$|ft\..*$/g, '').replace(/[^a-z0-9 ]/g, '').replace(/\s+/g, ' ').trim(); }
-async function getItunesClipBytes(title, artist) {
+// Strict-matched iTunes music-video preview URL (or null). Cached.
+async function getItunesMatch(title, artist) {
   const key = `${title}|${artist}`.toLowerCase();
-  const c = _itunesBytes.get(key);
-  if (c && Date.now() - c.at < 6 * 60 * 60 * 1000) return c.buf;
+  if (_itunesMatch.has(key)) return _itunesMatch.get(key);
+  let url = null;
   try {
     const term = encodeURIComponent(`${title} ${artist}`.trim());
     const r = await fetch(`https://itunes.apple.com/search?term=${term}&entity=musicVideo&limit=12&country=US`, { headers: { 'User-Agent': 'Mozilla/5.0' } });
     const j = await r.json();
-    const wantT = _normt(title), wantA = _normt(artist), aWords = wantA.split(' ').filter(Boolean);
+    const wantT = _normt(title), aWords = _normt(artist).split(' ').filter((w) => w.length > 2);
     const hit = (j.results || []).find((x) => {
       if (!x.previewUrl) return false;
       const n = _normt(x.trackName), a = _normt(x.artistName);
       const titleOk = n && (n.includes(wantT) || wantT.includes(n));
-      const artistOk = aWords.length && aWords.some((w) => w.length > 2 && a.includes(w));
+      const artistOk = aWords.length && aWords.some((w) => a.includes(w));
       return titleOk && artistOk;
     });
-    if (!hit) { _itunesBytes.set(key, { buf: null, at: Date.now() }); return null; }
-    const vr = await fetch(hit.previewUrl, { headers: { Range: 'bytes=0-511999', 'User-Agent': 'Mozilla/5.0' } });
+    url = hit?.previewUrl || null;
+  } catch (e) { console.warn('[itunes]', e.message); }
+  _itunesMatch.set(key, url);
+  if (_itunesMatch.size > 300) _itunesMatch.delete(_itunesMatch.keys().next().value);
+  return url;
+}
+async function getItunesClipBytes(title, artist) {
+  const key = `${title}|${artist}`.toLowerCase();
+  const c = _itunesBytes.get(key);
+  if (c && Date.now() - c.at < 6 * 60 * 60 * 1000) return c.buf;
+  const previewUrl = await getItunesMatch(title, artist);
+  if (!previewUrl) return null;
+  try {
+    const vr = await fetch(previewUrl, { headers: { Range: 'bytes=0-511999', 'User-Agent': 'Mozilla/5.0' } });
     if (vr.status !== 200 && vr.status !== 206) return null;
     const buf = Buffer.from(await vr.arrayBuffer());
     if (buf.length < 5000) return null;
     _itunesBytes.set(key, { buf, at: Date.now() });
     if (_itunesBytes.size > 60) _itunesBytes.delete(_itunesBytes.keys().next().value);
-    console.log(`[itunesclip] "${title}" → ${hit.trackName}/${hit.artistName} ${Math.round(buf.length / 1024)}KB`);
+    console.log(`[itunesclip] "${title}" → ${Math.round(buf.length / 1024)}KB`);
     return buf;
   } catch (e) { console.warn('[itunesclip]', e.message); return null; }
 }
@@ -404,6 +418,12 @@ const server = http.createServer(async (req, res) => {
   // natively (expo-video), muted + looped. No ads, light, no 403.
   if (parsed.pathname === '/videoclip') {
     try {
+      // ?check=1 → cheap existence check (no byte fetch) so the app knows whether
+      // to use this layer or fall through to its in-app YouTube fallback.
+      if (q.check) {
+        const u = await getItunesMatch(q.title || '', q.artist || '');
+        res.writeHead(200); res.end(JSON.stringify({ available: !!u })); return;
+      }
       // iTunes (legal, server-side, strict-matched). YouTube is datacenter-blocked
       // here, so the app does YouTube in-app as its own last-resort fallback.
       const buf = await getItunesClipBytes(q.title || '', q.artist || '');
