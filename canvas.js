@@ -14,7 +14,8 @@ const SECRETS_URL = 'https://raw.githubusercontent.com/xyloflake/spot-secrets-go
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36';
 
 let _totp = null, _totpVer = null, _secretsFetched = 0;
-let _token = null, _tokenExp = 0;
+let _token = null, _tokenExp = 0, _clientId = null;
+let _clientToken = null, _clientTokenExp = 0;
 const _canvasCache = new Map();   // trackUri -> { url, at }
 const _trackCache  = new Map();   // "title|artist" -> trackUri
 
@@ -73,8 +74,25 @@ async function getToken() {
   let d; try { d = JSON.parse(_raw); } catch { throw new Error(`token ${r.status}: ${_raw.slice(0, 60)}`); }
   if (!d.accessToken) throw new Error('no accessToken (sp_dc expired or TOTP rejected)');
   _token = d.accessToken;
+  _clientId = d.clientId || _clientId;
   _tokenExp = d.accessTokenExpirationTimestampMs || (Date.now() + 50 * 60 * 1000);
   return _token;
+}
+
+// Client-token (required by the internal pathfinder API alongside the Bearer token).
+async function getClientToken() {
+  if (_clientToken && Date.now() < _clientTokenExp - 60000) return _clientToken;
+  if (!_clientId) await getToken();
+  const r = await fetch('https://clienttoken.spotify.com/v1/clienttoken', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'User-Agent': UA },
+    body: JSON.stringify({ client_data: { client_version: '1.2.50', client_id: _clientId,
+      js_sdk_data: { device_brand: 'unknown', device_model: 'unknown', os: 'windows', os_version: 'NT 10.0', device_id: '', device_type: 'computer' } } }),
+  });
+  const d = await r.json();
+  _clientToken = d?.granted_token?.token || null;
+  _clientTokenExp = Date.now() + ((d?.granted_token?.refresh_after_seconds || 1200) * 1000);
+  return _clientToken;
 }
 
 // ── Minimal protobuf (schema is tiny) ─────────────────────────────────────────
@@ -107,45 +125,35 @@ function parseCanvasUrl(buf) {
   return null;
 }
 
-// ── Client-credentials token (for /v1/search) ─────────────────────────────────
-// The sp_dc web-player token is blocked (429) on the public /v1/search endpoint,
-// so to look up a Spotify track id from title+artist we use a normal app
-// client-credentials token (proper rate limits). Configure SPOTIFY_CLIENT_ID +
-// SPOTIFY_CLIENT_SECRET env vars; without them, search is skipped (tracks that
-// already have a Spotify id still get canvases).
-const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || '517db6a178194f7bbfe997448068f102';
-const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || '';
-let _ccToken = null, _ccExp = 0;
-async function getCcToken() {
-  if (!SPOTIFY_CLIENT_SECRET) return null;
-  if (_ccToken && Date.now() < _ccExp - 30000) return _ccToken;
-  const auth = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
-  const r = await fetch('https://accounts.spotify.com/api/token', {
-    method: 'POST',
-    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: 'grant_type=client_credentials',
-  });
-  const d = await r.json();
-  if (!d.access_token) return null;
-  _ccToken = d.access_token;
-  _ccExp = Date.now() + (d.expires_in || 3600) * 1000;
-  return _ccToken;
-}
-
-// ── Spotify search (to resolve a track URI from title+artist) ─────────────────
+// ── Spotify search via internal pathfinder API (works on FREE tier) ───────────
+// The public /v1/search now requires the app owner to have Premium (Spotify Feb
+// 2026 change → 403). So we use the same internal GraphQL endpoint the web player
+// itself uses, driven by the sp_dc token + client-token. It needs a persistedQuery
+// hash that Spotify rotates occasionally; if it goes stale the request fails and
+// we return null → the app shows album art (never breaks). Update SEARCH_HASH then.
+const SEARCH_HASH = process.env.SEARCH_HASH || 'd9f785900f0710b31c07818d617f4f7600c1e21217e80f5b043d1e78d74e6026';
+function _norm(s = '') { return s.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim(); }
 async function searchTrackUri(title, artist) {
   const key = `${title}|${artist}`.toLowerCase();
   if (_trackCache.has(key)) return _trackCache.get(key);
   try {
-    const token = await getCcToken();
-    if (!token) { _trackCache.set(key, null); return null; }  // search not configured
-    const q = encodeURIComponent(`${title} ${artist}`.trim());
-    const r = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&q=${q}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!r.ok) { _trackCache.set(key, null); return null; }
-    const d = await r.json();
-    const uri = d?.tracks?.items?.[0]?.uri || null;
+    const [token, clientToken] = await Promise.all([getToken(), getClientToken()]);
+    const variables = { searchTerm: `${title} ${artist}`.trim(), offset: 0, limit: 5, numberOfTopResults: 5, includeAudiobooks: false, includePreReleases: false };
+    const extensions = { persistedQuery: { version: 1, sha256Hash: SEARCH_HASH } };
+    const url = `https://api-partner.spotify.com/pathfinder/v1/query?operationName=searchDesktop&variables=${encodeURIComponent(JSON.stringify(variables))}&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, 'client-token': clientToken || '', 'app-platform': 'WebPlayer', Accept: 'application/json', 'User-Agent': UA } });
+    if (!r.ok) { _trackCache.set(key, null); return null; }    // hash stale / rejected → fallback
+    const j = await r.json();
+    const items = j?.data?.searchV2?.tracksV2?.items || [];
+    // Prefer a result whose artist matches; else take the top result.
+    const wantA = _norm(artist), wantT = _norm(title);
+    let pick = items.find((it) => {
+      const d = it?.item?.data; if (!d?.uri) return false;
+      const a = _norm(d?.artists?.items?.[0]?.profile?.name || '');
+      const t = _norm(d?.name || '');
+      return (wantA && a.includes(wantA.split(' ')[0])) && (wantT && (t.includes(wantT) || wantT.includes(t)));
+    }) || items.find((it) => it?.item?.data?.uri);
+    const uri = pick?.item?.data?.uri || null;
     _trackCache.set(key, uri);
     return uri;
   } catch {
@@ -177,28 +185,15 @@ async function fetchCanvas(trackUri) {
   return url;
 }
 
-// Diagnostic: reports why search may be failing (no secret leaked).
+// Diagnostic: end-to-end check of the pathfinder search → canvas path.
 export async function canvasDiag(title = 'Espresso', artist = 'Sabrina Carpenter') {
-  const out = { secretSet: !!SPOTIFY_CLIENT_SECRET, clientId: SPOTIFY_CLIENT_ID.slice(0, 6) + '…' };
+  const out = {};
   try {
-    const auth = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
-    const r = await fetch('https://accounts.spotify.com/api/token', {
-      method: 'POST', headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: 'grant_type=client_credentials',
-    });
-    const d = await r.json();
-    out.ccTokenStatus = r.status;
-    out.ccTokenOk = !!d.access_token;
-    if (d.error) out.ccError = `${d.error}: ${d.error_description || ''}`.slice(0, 80);
-    if (d.access_token) {
-      const sr = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&market=US&q=${encodeURIComponent(`${title} ${artist}`)}`, {
-        headers: { Authorization: `Bearer ${d.access_token}` },
-      });
-      out.searchStatus = sr.status;
-      const raw = await sr.text();
-      try { const sd = JSON.parse(raw); out.foundUri = sd?.tracks?.items?.[0]?.uri || null; out.searchErr = sd?.error?.message; }
-      catch { out.searchBody = raw.slice(0, 120); }
-    }
+    out.tokenOk = !!(await getToken());
+    out.clientTokenOk = !!(await getClientToken());
+    const uri = await searchTrackUri(title, artist);
+    out.foundUri = uri;
+    if (uri) out.canvasUrl = (await fetchCanvas(uri)) ? 'yes' : 'no-canvas-for-track';
   } catch (e) { out.exception = e.message; }
   return out;
 }
