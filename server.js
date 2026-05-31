@@ -146,6 +146,37 @@ const YT_HEADERS = {
   'Referer':    'https://www.youtube.com/',
 };
 
+// ── Video (Clip) format ───────────────────────────────────────────────────────
+// For the muted, looping full-screen Clip we want the LIGHTEST playable video so
+// it starts fast even on slow connections. Prefer a progressive (muxed) mp4 —
+// itag 18 (360p) is a single self-contained file that plays in any native
+// player. Fall back to the smallest video-only mp4 (≈144–360p).
+function bestVideo(info) {
+  // Progressive/muxed mp4 (audio+video in one file → most reliable to play)
+  const prog = (info.streaming_data?.formats ?? [])
+    .filter(f => f.url && (f.mime_type || '').startsWith('video/mp4'))
+    .sort((a, b) => (a.height || 9999) - (b.height || 9999));
+  if (prog[0]?.url) return prog[0];
+
+  // Video-only mp4 adaptive — pick the smallest height ≥ 140 (lightest)
+  const vo = (info.streaming_data?.adaptive_formats ?? [])
+    .filter(f => f.url && (f.mime_type || '').startsWith('video/mp4') && (f.height || 0) >= 140)
+    .sort((a, b) => (a.height || 9999) - (b.height || 9999));
+  return vo[0] || null;
+}
+async function getVideoFormat(yt, videoId) {
+  for (const client of ['IOS', 'ANDROID', 'TV_EMBEDDED', 'WEB']) {
+    try {
+      const info = await yt.getBasicInfo(videoId, { client });
+      const fmt  = bestVideo(info);
+      if (fmt?.url) return { info, fmt };
+    } catch (e) {
+      console.warn(`[clip] ${client} client error for ${videoId}:`, e.message);
+    }
+  }
+  return null;
+}
+
 // ── HTTPS helper ──────────────────────────────────────────────────────────────
 function httpsGetJson(url, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
@@ -246,6 +277,40 @@ const server = http.createServer(async (req, res) => {
   if (parsed.pathname === '/ping') {
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, app: 'Grooviq Cloud' }));
+    return;
+  }
+
+  // ── /clip — low-res music-video stream for the player's looping Clip ───────
+  // App passes the resolved YouTube video id (?id=) — or title/artist to search.
+  // Returns a light progressive/video-only mp4 URL that plays muted + looping.
+  if (parsed.pathname === '/clip') {
+    try {
+      const yt = await getYtClient();
+      let vid = (q.id || '').trim();
+      if (!/^[A-Za-z0-9_-]{11}$/.test(vid)) {
+        // Fallback: search for the official video by title/artist
+        const sq = `${q.title || ''} ${q.artist || ''} official video`.trim();
+        const sr = await yt.search(sq);
+        const v = (sr.results ?? []).find(x => (x.type === 'Video' || x.constructor?.name === 'Video') && x.id?.length === 11);
+        vid = v?.id || '';
+      }
+      if (!vid) { res.writeHead(404); res.end(JSON.stringify({ error: 'no video' })); return; }
+
+      const result = await getVideoFormat(yt, vid);
+      if (!result?.fmt?.url) { res.writeHead(404); res.end(JSON.stringify({ error: 'no playable video format' })); return; }
+      console.log(`[clip] ✓ ${vid} → ${result.fmt.height}p (itag ${result.fmt.itag})`);
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        url: result.fmt.url,
+        videoId: vid,
+        height: result.fmt.height || null,
+        durationMs: (result.info.basic_info?.duration || 0) * 1000,
+      }));
+    } catch (e) {
+      console.error('[clip] error:', e.message);
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
     return;
   }
 
