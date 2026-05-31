@@ -131,18 +131,50 @@ function parseCanvasUrl(buf) {
 // itself uses, driven by the sp_dc token + client-token. It needs a persistedQuery
 // hash that Spotify rotates occasionally; if it goes stale the request fails and
 // we return null → the app shows album art (never breaks). Update SEARCH_HASH then.
-const SEARCH_HASH = process.env.SEARCH_HASH || 'd9f785900f0710b31c07818d617f4f7600c1e21217e80f5b043d1e78d74e6026';
+// One or more searchDesktop persistedQuery hashes (comma-separated env override).
+// Spotify rotates these; we try each in turn, and self-alert (Discord) when ALL
+// are dead so the hash can be refreshed — see _alertStaleHash().
+const SEARCH_HASHES = (process.env.SEARCH_HASH || 'd9f785900f0710b31c07818d617f4f7600c1e21217e80f5b043d1e78d74e6026')
+  .split(',').map((h) => h.trim()).filter(Boolean);
+let _goodHash = SEARCH_HASHES[0];
+let _lastAlert = 0;
+
+async function _alertStaleHash() {
+  // Debounce to once / 6h, and only if a webhook is configured.
+  const wh = process.env.DISCORD_WEBHOOK;
+  if (!wh || Date.now() - _lastAlert < 6 * 60 * 60 * 1000) return;
+  _lastAlert = Date.now();
+  try {
+    await fetch(wh, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: '⚠️ **Grooviq canvas**: the Spotify searchDesktop hash is stale — canvases for non-imported songs are off until SEARCH_HASH is refreshed in Render env.' }) });
+  } catch {}
+}
+
+async function _pathfinderSearch(token, clientToken, term, hash) {
+  const variables = { searchTerm: term, offset: 0, limit: 5, numberOfTopResults: 5, includeAudiobooks: false, includePreReleases: false };
+  const extensions = { persistedQuery: { version: 1, sha256Hash: hash } };
+  const url = `https://api-partner.spotify.com/pathfinder/v1/query?operationName=searchDesktop&variables=${encodeURIComponent(JSON.stringify(variables))}&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;
+  return fetch(url, { headers: { Authorization: `Bearer ${token}`, 'client-token': clientToken || '', 'app-platform': 'WebPlayer', Accept: 'application/json', 'User-Agent': UA } });
+}
+
 function _norm(s = '') { return s.toLowerCase().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim(); }
 async function searchTrackUri(title, artist) {
   const key = `${title}|${artist}`.toLowerCase();
   if (_trackCache.has(key)) return _trackCache.get(key);
   try {
     const [token, clientToken] = await Promise.all([getToken(), getClientToken()]);
-    const variables = { searchTerm: `${title} ${artist}`.trim(), offset: 0, limit: 5, numberOfTopResults: 5, includeAudiobooks: false, includePreReleases: false };
-    const extensions = { persistedQuery: { version: 1, sha256Hash: SEARCH_HASH } };
-    const url = `https://api-partner.spotify.com/pathfinder/v1/query?operationName=searchDesktop&variables=${encodeURIComponent(JSON.stringify(variables))}&extensions=${encodeURIComponent(JSON.stringify(extensions))}`;
-    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, 'client-token': clientToken || '', 'app-platform': 'WebPlayer', Accept: 'application/json', 'User-Agent': UA } });
-    if (!r.ok) { _trackCache.set(key, null); return null; }    // hash stale / rejected → fallback
+    const term = `${title} ${artist}`.trim();
+    // Try the last-known-good hash first, then any other configured hashes.
+    let r = await _pathfinderSearch(token, clientToken, term, _goodHash);
+    if (!r.ok) {
+      let recovered = false;
+      for (const h of SEARCH_HASHES) {
+        if (h === _goodHash) continue;
+        const rr = await _pathfinderSearch(token, clientToken, term, h);
+        if (rr.ok) { _goodHash = h; r = rr; recovered = true; break; }
+      }
+      if (!recovered) { _alertStaleHash(); _trackCache.set(key, null); return null; }
+    }
     const j = await r.json();
     const items = j?.data?.searchV2?.tracksV2?.items || [];
     // Prefer a result whose artist matches; else take the top result.
