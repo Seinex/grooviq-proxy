@@ -180,6 +180,48 @@ async function getVideoFormat(yt, videoId) {
   return null;
 }
 
+// ── Music-video CLIP (for songs without a Spotify Canvas) ─────────────────────
+// Resolves the official video, then fetches only the FIRST ~400KB of the lowest
+// (≈240p) mp4 — a self-contained ~12s segment (starts with ftyp+moov) — and serves
+// those bytes. The googlevideo fetch happens HERE (proxy IP = the IP that resolved
+// the URL), so the app never hits a 403. No ads (raw video, not the embed player),
+// tiny (~400KB), and the app plays it muted on loop. Cached per video for 6h.
+const _clipBytes = new Map(); // videoId -> { buf, at }
+const CLIP_RANGE = 'bytes=0-409599'; // ~400KB
+function bestClipVideo(info) {
+  // Lightest first: smallest video-only mp4 ≥140, else progressive.
+  const vo = (info.streaming_data?.adaptive_formats ?? [])
+    .filter(f => f.url && (f.mime_type || '').startsWith('video/mp4') && (f.height || 0) >= 140)
+    .sort((a, b) => (a.height || 9999) - (b.height || 9999));
+  if (vo.find(f => f.height >= 240)) return vo.find(f => f.height >= 240);
+  if (vo[0]) return vo[0];
+  return bestVideo(info);
+}
+async function getClipBytes(yt, { id, title, artist }) {
+  let vid = (id || '').trim();
+  if (!/^[A-Za-z0-9_-]{11}$/.test(vid)) {
+    const sr = await yt.search(`${title || ''} ${artist || ''} official video`.trim());
+    const v = (sr.results ?? []).find(x => (x.type === 'Video' || x.constructor?.name === 'Video') && x.id?.length === 11);
+    vid = v?.id || '';
+  }
+  if (!vid) return null;
+  const c = _clipBytes.get(vid);
+  if (c && Date.now() - c.at < 6 * 60 * 60 * 1000) return c.buf;
+  let fmt = null;
+  for (const client of ['IOS', 'ANDROID', 'WEB']) {
+    try { const info = await yt.getBasicInfo(vid, { client }); const f = bestClipVideo(info); if (f?.url) { fmt = f; break; } } catch {}
+  }
+  if (!fmt?.url) return null;
+  const r = await fetch(fmt.url, { headers: { Range: CLIP_RANGE, 'User-Agent': 'Mozilla/5.0 (Linux; Android 14)' } });
+  if (r.status !== 200 && r.status !== 206) return null;
+  const buf = Buffer.from(await r.arrayBuffer());
+  if (buf.length < 5000) return null;
+  _clipBytes.set(vid, { buf, at: Date.now() });
+  if (_clipBytes.size > 50) _clipBytes.delete(_clipBytes.keys().next().value);
+  console.log(`[videoclip] ${vid} → ${Math.round(buf.length / 1024)}KB (${fmt.height}p)`);
+  return buf;
+}
+
 // ── HTTPS helper ──────────────────────────────────────────────────────────────
 function httpsGetJson(url, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
@@ -318,6 +360,28 @@ const server = http.createServer(async (req, res) => {
       console.error('[canvas] error:', e.message);
       res.writeHead(200);   // soft-fail → app falls back to album art
       res.end(JSON.stringify({ canvasUrl: null, error: e.message }));
+    }
+    return;
+  }
+
+  // ── /videoclip — short muted music-video loop for songs without a Canvas ──
+  // Serves a ~400KB self-contained mp4 segment of the official video. Plays
+  // natively (expo-video), muted + looped. No ads, light, no 403.
+  if (parsed.pathname === '/videoclip') {
+    try {
+      const yt = await getYtClient();
+      const buf = await getClipBytes(yt, { id: q.id, title: q.title, artist: q.artist });
+      if (!buf) { res.writeHead(404); res.end(JSON.stringify({ error: 'no clip' })); return; }
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Content-Length': buf.length,
+        'Cache-Control': 'public, max-age=21600',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(buf);
+    } catch (e) {
+      console.error('[videoclip] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
     }
     return;
   }
