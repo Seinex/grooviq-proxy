@@ -68,7 +68,9 @@ async function getToken() {
   const r = await fetch(`https://open.spotify.com/api/token?${params}`, {
     headers: { 'User-Agent': UA, Origin: 'https://open.spotify.com/', Referer: 'https://open.spotify.com/', Cookie: `sp_dc=${SP_DC}` },
   });
-  const d = await r.json();
+  const _raw = await r.text();
+  if (process.env.CANVAS_DEBUG) console.log('[canvas] token HTTP', r.status, '| totp', params.get('totp'), '| body:', _raw.slice(0, 120));
+  let d; try { d = JSON.parse(_raw); } catch { throw new Error(`token ${r.status}: ${_raw.slice(0, 60)}`); }
   if (!d.accessToken) throw new Error('no accessToken (sp_dc expired or TOTP rejected)');
   _token = d.accessToken;
   _tokenExp = d.accessTokenExpirationTimestampMs || (Date.now() + 50 * 60 * 1000);
@@ -105,19 +107,51 @@ function parseCanvasUrl(buf) {
   return null;
 }
 
+// ── Client-credentials token (for /v1/search) ─────────────────────────────────
+// The sp_dc web-player token is blocked (429) on the public /v1/search endpoint,
+// so to look up a Spotify track id from title+artist we use a normal app
+// client-credentials token (proper rate limits). Configure SPOTIFY_CLIENT_ID +
+// SPOTIFY_CLIENT_SECRET env vars; without them, search is skipped (tracks that
+// already have a Spotify id still get canvases).
+const SPOTIFY_CLIENT_ID = process.env.SPOTIFY_CLIENT_ID || '517db6a178194f7bbfe997448068f102';
+const SPOTIFY_CLIENT_SECRET = process.env.SPOTIFY_CLIENT_SECRET || '';
+let _ccToken = null, _ccExp = 0;
+async function getCcToken() {
+  if (!SPOTIFY_CLIENT_SECRET) return null;
+  if (_ccToken && Date.now() < _ccExp - 30000) return _ccToken;
+  const auth = Buffer.from(`${SPOTIFY_CLIENT_ID}:${SPOTIFY_CLIENT_SECRET}`).toString('base64');
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+  });
+  const d = await r.json();
+  if (!d.access_token) return null;
+  _ccToken = d.access_token;
+  _ccExp = Date.now() + (d.expires_in || 3600) * 1000;
+  return _ccToken;
+}
+
 // ── Spotify search (to resolve a track URI from title+artist) ─────────────────
 async function searchTrackUri(title, artist) {
   const key = `${title}|${artist}`.toLowerCase();
   if (_trackCache.has(key)) return _trackCache.get(key);
-  const token = await getToken();
-  const q = encodeURIComponent(`${title} ${artist}`.trim());
-  const r = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&q=${q}`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  const d = await r.json();
-  const uri = d?.tracks?.items?.[0]?.uri || null;
-  _trackCache.set(key, uri);
-  return uri;
+  try {
+    const token = await getCcToken();
+    if (!token) { _trackCache.set(key, null); return null; }  // search not configured
+    const q = encodeURIComponent(`${title} ${artist}`.trim());
+    const r = await fetch(`https://api.spotify.com/v1/search?type=track&limit=1&q=${q}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!r.ok) { _trackCache.set(key, null); return null; }
+    const d = await r.json();
+    const uri = d?.tracks?.items?.[0]?.uri || null;
+    _trackCache.set(key, uri);
+    return uri;
+  } catch {
+    _trackCache.set(key, null);
+    return null;
+  }
 }
 
 // ── Canvas fetch ──────────────────────────────────────────────────────────────
