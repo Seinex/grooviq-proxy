@@ -22,7 +22,9 @@ import { getCanvasUrl, canvasConfigured, canvasDiag } from './canvas.js';
 
 // Render.com sets $PORT automatically (usually 10000). On other hosts use 4568.
 const PORT         = parseInt(process.env.PORT  || '4568', 10);
+// Set via Render env var (do NOT hardcode the real token in this public repo).
 const CLOUD_TOKEN  = process.env.CLOUD_TOKEN    || 'grooviq-cloud-2026';
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || ''; // feedback delivery (server-only)
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const _rateMap = new Map();
@@ -278,6 +280,24 @@ const server = http.createServer(async (req, res) => {
   if (parsed.pathname === '/ping') {
     res.writeHead(200);
     res.end(JSON.stringify({ ok: true, app: 'Grooviq Cloud' }));
+    return;
+  }
+
+  // ── /feedback — forward in-app bug reports to Discord (webhook stays server-side) ──
+  if (parsed.pathname === '/feedback' && req.method === 'POST') {
+    let body = '';
+    req.on('data', (c) => { body += c; if (body.length > 8000) req.destroy(); });
+    req.on('end', async () => {
+      try {
+        const { content } = JSON.parse(body || '{}');
+        if (!DISCORD_WEBHOOK || !content) { res.writeHead(200); res.end(JSON.stringify({ ok: false })); return; }
+        await fetch(DISCORD_WEBHOOK, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: String(content).slice(0, 1900) }),
+        });
+        res.writeHead(200); res.end(JSON.stringify({ ok: true }));
+      } catch (e) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: e.message })); }
+    });
     return;
   }
 
