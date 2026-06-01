@@ -19,6 +19,7 @@ import crypto from 'crypto';
 import { parse as parseUrl } from 'url';
 import { Innertube } from 'youtubei.js';
 import { getCanvasUrl, canvasConfigured, canvasDiag } from './canvas.js';
+import { getDeezerMp3, deezerHasTrack, deezerConfigured, deezerDiag } from './deezer.js';
 
 // Render.com sets $PORT automatically (usually 10000). On other hosts use 4568.
 const PORT         = parseInt(process.env.PORT  || '4568', 10);
@@ -390,6 +391,32 @@ const server = http.createServer(async (req, res) => {
       } catch (e) { res.writeHead(200); res.end(JSON.stringify({ ok: false, error: e.message })); }
     });
     return;
+  }
+
+  // ── /deezer — full-length track audio from Deezer (huge catalog incl. Afrobeats) ──
+  // App passes the EXACT Deezer track id (already known from search) → no matching.
+  if (parsed.pathname === '/deezer') {
+    try {
+      if (!deezerConfigured()) { res.writeHead(503); res.end(JSON.stringify({ error: 'deezer-not-configured' })); return; }
+      if (q.check) {
+        const ok = await deezerHasTrack((q.id || '').trim());
+        res.writeHead(200); res.end(JSON.stringify({ available: ok })); return;
+      }
+      const buf = await getDeezerMp3((q.id || '').trim());
+      if (!buf || buf.length < 5000) { res.writeHead(404); res.end(JSON.stringify({ error: 'no track' })); return; }
+      res.writeHead(200, {
+        'Content-Type': 'audio/mpeg',
+        'Content-Length': buf.length,
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'public, max-age=3600',
+        'Access-Control-Allow-Origin': '*',
+      });
+      res.end(buf);
+    } catch (e) { console.error('[deezer] route:', e.message); res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
+    return;
+  }
+  if (parsed.pathname === '/deezerdiag') {
+    const d = await deezerDiag(); res.writeHead(200); res.end(JSON.stringify(d)); return;
   }
 
   // ── /canvasdiag — debug why search may fail (no secret leaked) ──
