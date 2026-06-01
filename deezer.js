@@ -12,6 +12,7 @@
 // Free account = MP3_128. Set DEEZER_ARL env on Render.
 
 import crypto from 'crypto';
+import { makeBlowfish, blowfishCbcDecrypt } from './blowfish.js';
 
 const ARL = process.env.DEEZER_ARL || '';
 const BF_SECRET = 'g4el58wc0zvf9na1';
@@ -84,16 +85,15 @@ function blowfishKey(sngId) {
 }
 
 // Deezer encrypts every 3rd 2048-byte chunk with Blowfish-CBC (null-ish IV 0..7).
+// Pure-JS Blowfish (no OpenSSL) so it works on any Node version.
 function decryptStripe(buf, key) {
+  const bf = makeBlowfish(key);
   const out = Buffer.alloc(buf.length);
   let pos = 0, i = 0;
   while (pos < buf.length) {
     const chunk = buf.subarray(pos, pos + 2048);
     if (i % 3 === 0 && chunk.length === 2048) {
-      const d = crypto.createDecipheriv('bf-cbc', key, BF_IV);
-      d.setAutoPadding(false);
-      const dec = Buffer.concat([d.update(chunk), d.final()]);
-      dec.copy(out, pos);
+      blowfishCbcDecrypt(bf, chunk, BF_IV).copy(out, pos);
     } else {
       chunk.copy(out, pos);
     }
@@ -144,12 +144,12 @@ export async function deezerHasTrack(sngId) {
 // Lightweight diagnostic (no audio): is the ARL valid + can we get a stream url?
 export async function deezerDiag(sngId = '3135556') { // 3135556 = "Harder Better Faster Stronger"
   const out = { arlSet: !!ARL, node: process.version };
-  // Is the bf-cbc legacy cipher actually available on this host?
+  // Pure-JS Blowfish self-test (canonical vector key=0,pt=0 -> 4EF997456198DD78).
   try {
-    const d = crypto.createDecipheriv('bf-cbc', blowfishKey('1'), BF_IV);
-    d.setAutoPadding(false);
-    Buffer.concat([d.update(Buffer.alloc(2048)), d.final()]);
-    out.bfCbc = 'ok';
+    const bf = makeBlowfish(Buffer.alloc(8));
+    const iv = Buffer.from('4ef997456198dd78', 'hex'); // C(0) under bf -> decrypts to 0
+    const dec = blowfishCbcDecrypt(bf, iv, Buffer.alloc(8));
+    out.bfCbc = dec.equals(Buffer.alloc(8)) ? 'ok (pure-js)' : 'FAIL: vector mismatch';
   } catch (e) { out.bfCbc = 'FAIL: ' + e.message; }
   try {
     const s = await getSession();
