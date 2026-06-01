@@ -143,7 +143,14 @@ export async function deezerHasTrack(sngId) {
 
 // Lightweight diagnostic (no audio): is the ARL valid + can we get a stream url?
 export async function deezerDiag(sngId = '3135556') { // 3135556 = "Harder Better Faster Stronger"
-  const out = { arlSet: !!ARL };
+  const out = { arlSet: !!ARL, node: process.version };
+  // Is the bf-cbc legacy cipher actually available on this host?
+  try {
+    const d = crypto.createDecipheriv('bf-cbc', blowfishKey('1'), BF_IV);
+    d.setAutoPadding(false);
+    Buffer.concat([d.update(Buffer.alloc(2048)), d.final()]);
+    out.bfCbc = 'ok';
+  } catch (e) { out.bfCbc = 'FAIL: ' + e.message; }
   try {
     const s = await getSession();
     out.sessionOk = true;
