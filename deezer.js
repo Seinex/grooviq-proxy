@@ -112,9 +112,11 @@ export async function getDeezerMp3(sngId) {
     if (!token) { console.warn('[deezer] no track token for', sngId); return null; }
     const url = await getEncryptedUrl(token, s);
     if (!url) { console.warn('[deezer] no stream url (rights?) for', sngId); return null; }
-    const r = await fetch(url, { headers: { 'User-Agent': UA } });
-    if (!r.ok) { console.warn('[deezer] stream fetch', r.status); return null; }
+    // cdnt-stream.dzcdn.net requires a Range header — a plain GET returns nothing.
+    const r = await fetch(url, { headers: { 'User-Agent': UA, Range: 'bytes=0-' } });
+    if (r.status !== 200 && r.status !== 206) { console.warn('[deezer] stream fetch', r.status); return null; }
     const enc = Buffer.from(await r.arrayBuffer());
+    if (enc.length < 2048) { console.warn('[deezer] empty stream', enc.length); return null; }
     const dec = decryptStripe(enc, blowfishKey(sngId));
     _mp3Cache.set(String(sngId), { buf: dec, at: Date.now() });
     if (_mp3Cache.size > 30) _mp3Cache.delete(_mp3Cache.keys().next().value);
