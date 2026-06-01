@@ -147,7 +147,20 @@ export async function deezerDiag(sngId = '3135556') { // 3135556 = "Harder Bette
     out.sessionOk = true;
     const token = await getTrackToken(sngId, s);
     out.trackToken = !!token;
-    if (token) out.streamUrl = !!(await getEncryptedUrl(token, s));
+    if (token) {
+      const url = await getEncryptedUrl(token, s);
+      out.streamUrl = !!url;
+      out.urlHost = url ? new URL(url).host : null;
+      if (url) {
+        // Does the CDN actually serve bytes from THIS (datacenter) IP?
+        try {
+          const r = await fetch(url, { headers: { 'User-Agent': UA, Range: 'bytes=0-4095' } });
+          out.cdnStatus = r.status;
+          const b = Buffer.from(await r.arrayBuffer());
+          out.cdnBytes = b.length;
+        } catch (e) { out.cdnError = e.message; }
+      }
+    }
   } catch (e) { out.error = e.message; }
   return out;
 }
