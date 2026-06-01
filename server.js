@@ -19,13 +19,25 @@ import crypto from 'crypto';
 import { parse as parseUrl } from 'url';
 import { Innertube } from 'youtubei.js';
 import { getCanvasUrl, canvasConfigured, canvasDiag } from './canvas.js';
-import { getDeezerMp3, deezerHasTrack, deezerConfigured, deezerDiag } from './deezer.js';
+import { getDeezerMp3, deezerHasTrack, deezerConfigured, deezerDiag, deezerHealth } from './deezer.js';
 
 // Render.com sets $PORT automatically (usually 10000). On other hosts use 4568.
 const PORT         = parseInt(process.env.PORT  || '4568', 10);
 // Set via Render env var (do NOT hardcode the real token in this public repo).
 const CLOUD_TOKEN  = process.env.CLOUD_TOKEN    || 'grooviq-cloud-2026';
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || ''; // feedback delivery (server-only)
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK || ''; // feedback + alert delivery (server-only)
+
+// Reusable Discord poster (used by /feedback and the Deezer self-heal monitor).
+async function postDiscord(content) {
+  if (!DISCORD_WEBHOOK || !content) return false;
+  try {
+    await fetch(DISCORD_WEBHOOK, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: String(content).slice(0, 1900) }),
+    });
+    return true;
+  } catch { return false; }
+}
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 const _rateMap = new Map();
@@ -418,6 +430,12 @@ const server = http.createServer(async (req, res) => {
   if (parsed.pathname === '/deezerdiag') {
     const d = await deezerDiag(q.id || undefined); res.writeHead(200); res.end(JSON.stringify(d)); return;
   }
+  // ── /deezerhealth — self-healing monitor endpoint (cron/uptime pings this) ──
+  // Forces a fresh end-to-end resolve; posts a Discord alert (debounced) if down.
+  if (parsed.pathname === '/deezerhealth') {
+    const h = await deezerHealth(postDiscord);
+    res.writeHead(h.healthy ? 200 : 503); res.end(JSON.stringify(h)); return;
+  }
 
   // ── /canvasdiag — debug why search may fail (no secret leaked) ──
   if (parsed.pathname === '/canvasdiag') {
@@ -748,6 +766,17 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`   Token: ${CLOUD_TOKEN}\n`);
   // Pre-warm the YouTube client so the first request isn't slow
   getYtClient().catch(e => console.error('[yt] pre-warm failed:', e.message));
+  // Self-healing: verify Deezer at boot + every 25 min while awake. The external
+  // cron (GitHub Action) is the reliable driver since Render free sleeps idle.
+  if (deezerConfigured()) {
+    const check = async (boot) => {
+      const h = await deezerHealth(postDiscord).catch(() => null);
+      if (h) console.log(`[deezer] health: ${h.healthy ? 'OK' : 'DOWN'} (${h.reason}, arl#${h.activeArl || '-'}/${h.arlCount})`);
+      if (boot && h && !h.healthy) await postDiscord(`🟥 **Grooviq · Deezer DOWN at boot** — \`${h.reason}\`. Refresh DEEZER_ARL on Render.`);
+    };
+    setTimeout(() => check(true), 8000);
+    setInterval(() => check(false), 25 * 60 * 1000).unref?.();
+  }
 });
 
 server.on('error', e => console.error('[cloud] server error:', e.message));
