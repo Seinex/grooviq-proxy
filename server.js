@@ -416,7 +416,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (parsed.pathname === '/deezerdiag') {
-    const d = await deezerDiag(); res.writeHead(200); res.end(JSON.stringify(d)); return;
+    const d = await deezerDiag(q.id || undefined); res.writeHead(200); res.end(JSON.stringify(d)); return;
   }
 
   // ── /canvasdiag — debug why search may fail (no secret leaked) ──
